@@ -90,6 +90,7 @@ class Version:
 
 
 class Requests:
+    # Kometa's own shipped assets (Default-Images, People-Images-*) don't need a per-run liveness check - unlike arbitrary user url_poster/url_background/url_logo/url_square_art values, the real staleness risk.
     stable_asset_prefixes = ("https://raw.githubusercontent.com/Kometa-Team/",)
 
     def __init__(self, local, part, env_branch, git_branch, verify_ssl=True):
@@ -97,7 +98,7 @@ class Requests:
         self.env_branch = env_branch
         self.git_branch = git_branch
         self.image_content_types = ["image/png", "image/jpeg", "image/webp"]
-        self._image_url_cache = {}
+        self._image_url_cache = {}  # Run-scoped memoization for get_image() - same URL within one run is always the same asset, no staleness risk.
         self._nightly = None
         self._master = None
         self._branch = None
@@ -113,16 +114,16 @@ class Requests:
         session = requests.Session()
         if not verify_ssl:
             self.no_verify_ssl(session)
+        # Every consumer (plexapi/tmdbapis/arrapi/this module's get/post) rides through session.request, so one hook here times all HTTP traffic.
         return timings.instrument_session(session)
 
     def no_verify_ssl(self, session=None):
         if session is None:
             session = self.session
         session.verify = False
-        # InsecureRequestWarning is only emitted for requests whose TLS
-        # verification is already disabled. Suppress it whenever Kometa has
-        # explicitly opted a session out of verification, including scoped
-        # Plex sessions created by plex.verify_ssl: false.
+        # InsecureRequestWarning only applies to requests whose certificate
+        # verification is already disabled, so suppress it for every explicit
+        # SSL opt-out, including scoped Plex sessions.
         import urllib3
 
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -130,6 +131,7 @@ class Requests:
     def download_image(self, title, image_url, download_directory, session=None, image_type="poster", filename=None):
         response = self.get_image(image_url, session=session)
         if response is None:
+            # get_image() only returns None for validate_only stable-asset-prefix skips, which download_image() never requests - unreachable in practice, guarded so pyright can narrow response below.
             raise Failed(f"Image Error: No response for Image URL: {image_url}")
         new_image = os.path.join(download_directory, f"{filename}") if filename else download_directory
         if response.headers["Content-Type"] == "image/jpeg":
@@ -153,21 +155,27 @@ class Requests:
             raise Failed(f"URL Error: No file found at {url}")
         if response.status_code >= 400:
             raise Failed(f"URL Error: {response.status_code} on {url}")
+        # get_yaml never sets a path, so save() was already a no-op here - read_only=True is a pure speed win (safe loader) plus a defensive guard against future misuse.
         return YAML(input_data=response.content, check_empty=check_empty, read_only=True)
 
     def get_image(self, url, session=None, validate_only=False):
+        # Keyed on (url, validate_only) so a bodyless HEAD check can never be served back to a caller that needs real content (nightly's leaked version wrote this cache but never read it back).
         cache_key = (url, validate_only)
         if cache_key in self._image_url_cache:
             return self._image_url_cache[cache_key]
+        # Skip the network round-trip entirely for validate_only checks against Kometa's own stable asset URLs - every run was re-validating ~239 static award/chart logos over the network for no reason.
         if validate_only and url.startswith(self.stable_asset_prefixes):
             return None
+        # self.get()/self.head(), not a raw session call, so image fetches keep the @retry exponential-backoff those wrappers provide (nightly's leaked version bypassed it).
         with timings.tag_context("image"):
             try:
                 if validate_only:
+                    # HEAD-only for validation-only callers (e.g. builder.py's url_poster/url_background/url_logo/url_square_art checks) - same status/Content-Type headers as GET, without downloading the body.
                     response = self.head(url, header=True) if session is None else session.head(url, headers=get_header(None, True, None), timeout=DEFAULT_TIMEOUT, allow_redirects=True)
                 else:
                     response = self.get(url, header=True) if session is None else session.get(url, headers=get_header(None, True, None), timeout=DEFAULT_TIMEOUT)
             except RequestException as e:
+                # Network-level failure (reset, timeout, DNS, etc.) is treated the same as an unreachable image, not a crash
                 raise Failed(f"Image Error: Unable to reach Image URL: {url} ({e})")
         if response.status_code == 404:
             raise Failed(f"Image Error: Not Found on Image URL: {url}")
@@ -251,6 +259,10 @@ class Requests:
 
     @property
     def branch(self):
+        # "develop" is kept as a recognized value here because installs still on that tag/branch genuinely
+        # report it via git_branch/env_branch - but develop is now just an automatic mirror of nightly (see
+        # release-develop.yml), so there's no longer a way to tell them apart by version/build number alone,
+        # and no need to: they're always identical.
         if self._branch is None:
             if self.git_branch in ["develop", "nightly"]:
                 self._branch = self.git_branch
@@ -302,6 +314,7 @@ class YAML:
         self.path = path
         self.input_data = input_data
         self.read_only = read_only
+        # read_only loads use ruamel's safe loader instead of the default round-trip loader - skips comment/formatting-preservation bookkeeping that's pure overhead for files we never save() back out.
         self.yaml = ruamel.yaml.YAML(typ="safe") if read_only else ruamel.yaml.YAML()
         if not read_only:
             self.yaml.width = 100000
@@ -326,6 +339,7 @@ class YAML:
                 e = f"Tabs are not allowed in YAML files; only spaces are allowed.\nfirst tab character found at:\n{location}"
             else:
                 e = str(e).replace("\n", "\n      ")
+
             raise Failed(f"YAML Error: {e}")
         except Exception as e:
             raise Failed(f"YAML Error: {e}")
